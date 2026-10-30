@@ -1,0 +1,1 @@
+"""Deterministic payout calculation and reconciliation helpers."""
