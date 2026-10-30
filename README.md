@@ -1,35 +1,117 @@
-# Rider Payout Dispute Desk
+# QuickDrop Rider Payout Dispute Desk
 
-Project by **Suyog Gouda**.
+An agentic support service for delivery riders who report missing or incorrect payouts. The service receives rider messages, checks trip exports and PaySwift, explains verified results, issues small eligible payments, and sends uncertain or higher-risk cases to operations.
 
-## Run
-Copy `.env.example` to `.env`, add the required OpenRouter, Mem0 and Pinecone values, then run `docker compose up --build`. The rider chat is at `http://localhost:8000/`; the ops dashboard is `http://localhost:8000/ops`. Health: `GET /health`.
+## Run Locally
 
-Run the evaluation with `python3 evals/run.py http://localhost:8000 http://localhost:8081`. Set `PAYSWIFT_BASE_URL` or pass a second argument when PaySwift is not at `http://localhost:8081`.
+Requirements:
 
-## Design
-FastAPI receives WhatsApp messages and uses `wamid` as the idempotency key. Postgres stores complete messages, traces, queue items and decisions. CSV exports provide trip facts; PaySwift is authoritative for actual payouts. The deterministic calculator applies IST dates, Decimal half-up rounding, trip fares, incentives and cancellation penalties. It alone decides verified shortfalls and payment limits.
+- Docker Desktop with Docker Compose
+- API credentials listed in `.env.example`
 
-OpenRouter extracts structured intent and entities. Mem0 stores searchable rider conversation facts. Pinecone retrieves policy context. These AI systems can interpret and recall context but cannot authorize money or replace trip/PaySwift evidence. Missing, mismatched, suspicious, repeat and over-limit claims enter the ops queue. Approved amounts are sent to PaySwift with an idempotency key.
+Create the environment file and start the complete stack:
 
-## Inspecting the agent
-Open `http://localhost:8000/` for the rider chat and `http://localhost:8000/ops` for the ops dashboard. The ops page shows pending approvals/escalations and lets an operator select a rider to inspect the ordered trace: incoming message, memory/policy/AI calls, deterministic reconciliation, decision, and reply. The same trace is available as JSON from `GET /trace/{rider_id}`. Pending work is available from `GET /ops/pending`.
+```bash
+cp .env.example .env
+# Add valid OpenRouter, Mem0, and Pinecone credentials to .env
+docker compose up --build
+```
 
-## Evaluation method
-This project uses a **deterministic black-box rubric**, not an LLM-as-judge score for financial behavior. The evaluator sends the supplied conversations through only the public service interface, reads PaySwift's payout ledger, reads the pending-ops queue, and checks each scenario for:
+Services:
 
-- HTTP success for every rider message
-- Exact payout delta and approval delta against `data/conversations.json`
-- Required facts in the rider-facing replies
-- Required `message_in` and `reply` trace events
-- Duplicate-message and safety outcomes through the same public interfaces
+- Rider chat: http://localhost:8000/
+- Operations dashboard: http://localhost:8000/ops
+- Health check: `GET http://localhost:8000/health`
+- PaySwift sandbox: http://localhost:8081
 
-The system should be reset to a fresh database and fresh PaySwift sandbox before a full run, as required by the assignment. Human-in-the-loop is a product control for large/repeat payments, not the evaluator: operators approve or reject queue items in the dashboard. LLM output is not trusted to judge money; exact expected values and PaySwift are the oracle.
+Stop the stack with:
 
-## Assumptions and limits
-The supplied exports are loaded at startup and represent the trip system for this exercise. Rider IDs are normalized for known export variants such as `003`, `R7` and `R007`. Disputes older than seven days are escalated. AI credentials are required by configuration; Mem0 recall and Pinecone policy retrieval are best-effort context tools and cannot authorize money. The evaluator should be run against a fresh database and PaySwift sandbox, as specified by the assignment. The raw Copilot session export used during development is included in `ai-logs/copilot-session-main.jsonl`.
+```bash
+docker compose down
+```
 
-## Validation
-Local validation: `43 passed` with `/usr/local/bin/python3 -m pytest -q`.
+## Public API
 
-Fresh-stack black-box evaluation on 2026-10-30: `10/24 scenarios passed` using `/usr/local/bin/python3 evals/run.py http://localhost:8000 http://localhost:8081`. The evaluator exposed remaining end-to-end failures in payout outcomes and some reply facts; this score must improve before submission.
+### Receive a rider message
+
+```http
+POST /messages
+Content-Type: application/json
+```
+
+```json
+{
+  "message_id": "wamid.KAZ5TCF7RARUVH",
+  "rider_id": "R003",
+  "text": "Bhai order T926334 ka surge nahi mila",
+  "received_at": "2026-09-22T09:05:00+05:30"
+}
+```
+
+The response is sent back to the rider:
+
+```json
+{
+  "reply": "Order T926334 ka verified difference ..."
+}
+```
+
+`message_id` is the vendor message ID and is used as the idempotency key. Duplicate deliveries receive a duplicate-message response and cannot create another payout.
+
+### Inspect operations
+
+- `GET /trace/{rider_id}` returns the ordered message, memory, policy, AI, reconciliation, decision, and reply events.
+- `GET /ops/pending` returns pending approvals and escalations.
+- `POST /ops/{item_id}/approved` approves a pending payment.
+- `POST /ops/{item_id}/rejected` rejects a pending item.
+
+## Agent Design
+
+The service is built with FastAPI, PostgreSQL, deterministic Python payout rules, and the PaySwift sandbox.
+
+1. **Message intake:** FastAPI validates the request and PostgreSQL records the message using its vendor ID.
+2. **Context gathering:** Mem0 recalls relevant rider conversation facts. Pinecone retrieves policy context when the configured policy index is available. These are best-effort context tools.
+3. **AI interpretation:** OpenRouter extracts intent, dates, trip IDs, language, and confidence. The model is not trusted to calculate or authorize money.
+4. **Evidence checks:** The application checks the supplied trip exports and reconciles actual amounts against PaySwift.
+5. **Deterministic decision:** The calculator applies base fares, distance, surge, half-up rounding, incentives, cancellation penalties, date rules, and payment limits.
+6. **Action:** Eligible shortfalls can be paid through PaySwift. Large, repeat, unclear, suspicious, stale, or failed-payment cases are added to the operations queue.
+7. **Traceability:** Every important action is persisted as an ordered trace event for operator review.
+
+## Financial Controls
+
+- PaySwift is authoritative for paid amounts.
+- The agent cannot pay more than the verified shortfall.
+- Automatic payments are limited to ₹200 per dispute and once per rider per day.
+- Larger or repeat payments require operations approval.
+- PaySwift idempotency keys protect payout requests from duplicate delivery.
+- Disputes outside the seven-day policy window are escalated.
+- A PaySwift failure becomes an operations escalation instead of an unconfirmed rider success.
+
+## Operations Workflow
+
+Open http://localhost:8000/ops to review pending work. An operator can see why a case was queued, approve or reject eligible payments, and select a rider to inspect the complete trace. The rider-facing chat remains available at http://localhost:8000/.
+
+## Evaluation
+
+The evaluator is deterministic and black-box. It sends the supplied conversations through the public API, compares payout and approval deltas with `data/conversations.json`, checks required reply facts, and verifies trace completeness. It does not use an LLM judge for financial behavior.
+
+Run it against a fresh database and fresh PaySwift sandbox:
+
+```bash
+docker compose down -v
+docker compose up --build -d
+python3 evals/run.py http://localhost:8000 http://localhost:8081
+```
+
+Current recorded result on 2026-10-30: **10 of 24 scenarios passed**. Local unit tests pass: **43 passed**. The evaluator still exposes end-to-end failures in payout outcomes and some multi-turn reply facts; this result should be improved before treating the project as production-ready.
+
+## Repository Notes
+
+- `app/`: API, agent, storage, data access, and payout logic
+- `data/`: trip, payout, and conversation fixtures
+- `docs/policy.md`: payout policy used by the deterministic calculator
+- `evals/run.py`: black-box evaluator
+- `tests/`: local regression tests
+- `ai-logs/copilot-session-main.jsonl`: raw Copilot session export used during development
+
+Do not commit `.env` or real API credentials. Use `.env.example` as the configuration template.
